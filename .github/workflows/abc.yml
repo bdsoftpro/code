@@ -1,0 +1,493 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'RDP Password'
+        required: true
+        type: string
+      session_minutes:
+        description: 'How many minutes is the session? (max 55)'
+        required: true
+        default: '50'
+        type: string
+      services:
+        description: 'Ingress rules'
+        required: true
+        default: 'app.emaker.store=http://127.0.0.1:8080 rdp.emaker.store=rdp://127.0.0.1:3389'
+        type: string
+      megalink:
+        description: 'Mega link for downloading files'
+        required: true
+        type: string
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: ${{ fromJSON(inputs.session_minutes) }}
+
+    steps:
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Set RDP password
+        shell: powershell
+        run: |
+          net user runneradmin "${{ inputs.password }}"
+
+      - name: Download Tools
+        shell: powershell
+        env:
+            GITHUB_TOKEN: ${{ vars.GTOKEN }}
+        run: |
+          $toolsDir = "D:\tools"
+          [System.IO.Directory]::CreateDirectory($toolsDir) | Out-Null
+
+          if (-not (Test-Path $toolsDir)) {
+              Write-Host "Cannot create directory: $toolsDir"
+              exit 1
+          }
+          
+          Add-Type -AssemblyName System.Net.Http
+          $handler = [System.Net.Http.HttpClientHandler]::new()
+          $client  = [System.Net.Http.HttpClient]::new($handler)
+          $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("token", "${{ vars.GTOKEN }}")
+          $client.DefaultRequestHeaders.UserAgent.ParseAdd("PowerShell")
+          $client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github.raw")
+
+          $url  = "https://api.github.com/repos/bdsoftpro/apk/contents/download.ps1"
+          $dest = "$toolsDir\download.ps1"
+
+          try {
+              $response = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+              [void]$response.EnsureSuccessStatusCode()
+
+              $stream = $response.Content.ReadAsStreamAsync().Result
+              $file   = [System.IO.File]::Create($dest)
+              try   { $stream.CopyTo($file) }
+              finally { $file.Close(); $stream.Close() }
+          }
+          finally { $client.Dispose() }
+          if (-not (Test-Path $toolsDir\download.ps1)) {
+              Write-Host "Download.ps1 not found!"
+              exit 1
+          }
+          Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$toolsDir\download.ps1`"" -WindowStyle Hidden
+          choco install megatools -y
+
+      - name: Clone Repositories
+        shell: powershell
+        run: |
+          git clone https://${{ vars.GTOKEN }}@github.com/bdsoftpro/shop.git D:\Project
+          if (Test-Path "D:\Project\assets") {
+            Remove-Item "D:\Project\assets\*" -Recurse -Force
+          }
+          megatools dl --path D:\Project\assets\ "${{ inputs.megalink }}"
+
+          # Shop.exe and sqlite3.dll come from bdsoftpro/apk (same place as
+          # TunnelServer.exe), not from the shop repository, so the repo stays
+          # source-only. Both must sit next to each other in D:\Server so the
+          # compiled exe finds the SQLite library.
+          New-Item -Path "D:\Server" -ItemType Directory -Force | Out-Null
+
+          Add-Type -AssemblyName System.Net.Http
+          $handler = [System.Net.Http.HttpClientHandler]::new()
+          $client  = [System.Net.Http.HttpClient]::new($handler)
+          $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("token", "${{ vars.GTOKEN }}")
+          $client.DefaultRequestHeaders.UserAgent.ParseAdd("PowerShell")
+          $client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github.raw")
+
+          $downloads = @(
+              @{ Name = "Shop.exe";    Dest = "D:\Server\Shop.exe" },
+              @{ Name = "sqlite3.dll"; Dest = "D:\Server\sqlite3.dll" }
+          )
+
+          try {
+              foreach ($item in $downloads) {
+                  $url  = "https://api.github.com/repos/bdsoftpro/apk/contents/$($item.Name)"
+                  $dest = $item.Dest
+                  $response = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+                  [void]$response.EnsureSuccessStatusCode()
+
+                  $stream = $response.Content.ReadAsStreamAsync().Result
+                  $file   = [System.IO.File]::Create($dest)
+                  try   { $stream.CopyTo($file) }
+                  finally { $file.Close(); $stream.Close() }
+
+                  Write-Host "$($item.Name) downloaded from bdsoftpro/apk ($((Get-Item $dest).Length) bytes)"
+              }
+          }
+          finally { $client.Dispose() }
+
+          foreach ($name in @("Shop.exe", "sqlite3.dll")) {
+              if (-not (Test-Path "D:\Server\$name")) {
+                  Write-Host "$name not found in bdsoftpro/apk!"
+                  exit 1
+              }
+          }
+          Write-Host "D:\Server is ready: Shop.exe + sqlite3.dll"
+
+          Copy-Item "D:\Project\web" "D:\Server" -Recurse -Force
+
+          if (-not (Test-Path "D:\Server\database")) {
+            New-Item -Path "D:\Server\database" -ItemType Directory -Force | Out-Null
+            Copy-Item "D:\Project\assets\*" "D:\Server\database" -Recurse -Force
+          }
+
+      - name: Install Shop hidden service
+        shell: powershell
+        run: |
+          # Shop.exe runs with no window (NSSM service, hidden process fallback).
+          # Relative --db resolves next to Shop.exe (D:\Server), see bin/server.dart.
+          $serverDir  = "D:\Server"
+          $exePath    = Join-Path $serverDir "Shop.exe"
+          $serviceName = "ShopSearchService"
+          $shopArgs   = "--db database --host 127.0.0.1 --port 8080 --quiet"
+          $logDir     = "$env:LOCALAPPDATA\Programs\logs"
+          New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+
+          if (-not (Test-Path $exePath)) {
+              Write-Host "Shop.exe not found at $exePath - skipping the shop service"
+              exit 0
+          }
+
+          # The SQLite library has to sit next to Shop.exe (AOT loads it from
+          # the executable's folder). Without it the exe falls back to
+          # winsqlite3.dll, which may miss FTS5 features.
+          $sqliteDll = Join-Path $serverDir "sqlite3.dll"
+          if (Test-Path $sqliteDll) {
+              Write-Host "sqlite3.dll found next to Shop.exe ($((Get-Item $sqliteDll).Length) bytes)"
+          } else {
+              Write-Host "WARNING: sqlite3.dll missing - Shop.exe will use winsqlite3.dll"
+          }
+
+          $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          $nssmExe = "$env:LOCALAPPDATA\Programs\nssm\nssm.exe"
+          $installed = $false
+
+          if ($isAdmin) {
+              # Reuse the NSSM copy from the tunnel step; download it otherwise.
+              if (-not (Test-Path $nssmExe)) {
+                  $ErrorActionPreference = "SilentlyContinue"
+                  $nssmZip = "$env:TEMP\nssm.zip"
+                  $extract = "$env:TEMP\nssm_extract_shop"
+                  Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip -UseBasicParsing
+                  if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+                  Expand-Archive -Path $nssmZip -DestinationPath $extract -Force
+                  $arch = if ([Environment]::Is64BitOperatingSystem) { "win64" } else { "win32" }
+                  $found = Get-ChildItem -Path $extract -Recurse -Filter "nssm.exe" |
+                           Where-Object { $_.FullName -like "*$arch*" } |
+                           Select-Object -First 1
+                  if ($found) {
+                      New-Item -Path (Split-Path $nssmExe) -ItemType Directory -Force | Out-Null
+                      Copy-Item $found.FullName -Destination $nssmExe -Force
+                  }
+                  $ErrorActionPreference = "Continue"
+              }
+
+              if (Test-Path $nssmExe) {
+                  # NSSM writes normal status messages to stderr; keep that from
+                  # becoming a terminating error in GitHub Actions.
+                  $ErrorActionPreference = "SilentlyContinue"
+
+                  if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+                      Write-Host "Shop service exists. Stopping and removing..."
+                      & $nssmExe stop $serviceName confirm | Out-Null
+                      & $nssmExe remove $serviceName confirm | Out-Null
+                      Start-Sleep -Seconds 2
+                  }
+
+                  & $nssmExe install $serviceName $exePath
+                  & $nssmExe set $serviceName AppDirectory $serverDir
+                  & $nssmExe set $serviceName DisplayName "Shop Search Service"
+                  & $nssmExe set $serviceName Description "Khoj Shop search API + UI (hidden, http://127.0.0.1:8080/ui)"
+                  & $nssmExe set $serviceName Start SERVICE_AUTO_START
+
+                  # Crash-restart behavior
+                  & $nssmExe set $serviceName AppExit Default Restart
+                  & $nssmExe set $serviceName AppRestartDelay 3000
+                  & $nssmExe set $serviceName AppThrottle 1500
+
+                  # Logging with rotation
+                  & $nssmExe set $serviceName AppStdout "$logDir\shop-stdout.log"
+                  & $nssmExe set $serviceName AppStderr "$logDir\shop-stderr.log"
+                  & $nssmExe set $serviceName AppRotateFiles 1
+                  & $nssmExe set $serviceName AppRotateOnline 1
+                  & $nssmExe set $serviceName AppRotateBytes 10485760
+
+                  # --db is relative to AppDirectory; Ctrl+C is our graceful stop.
+                  & $nssmExe set $serviceName AppParameters "$shopArgs"
+                  & $nssmExe set $serviceName AppStopMethodConsole 10000
+
+                  & $nssmExe start $serviceName | Out-Null
+                  Start-Sleep -Seconds 2
+                  $ErrorActionPreference = "Continue"
+                  $installed = $true
+              }
+          }
+
+          if (-not $installed) {
+              Write-Host "Starting Shop.exe as a hidden process (no service)"
+              Start-Process -FilePath $exePath -ArgumentList $shopArgs -WorkingDirectory $serverDir -WindowStyle Hidden
+          }
+
+          # The ingress rule app.emaker.store=http://127.0.0.1:8080 needs a listener.
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+              try {
+                  $health = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8080/health" -TimeoutSec 2
+                  if ($health.StatusCode -eq 200) { $ok = $true; break }
+              } catch { }
+              Start-Sleep -Seconds 1
+          }
+          if (-not $ok) {
+              Write-Host "---- shop-stderr.log (tail) ----"
+              Get-Content "$logDir\shop-stderr.log" -Tail 40 -ErrorAction SilentlyContinue
+              throw "Shop.exe did not answer http://127.0.0.1:8080/health"
+          }
+          if ($installed) {
+              Write-Host "ShopSearchService: $((Get-Service -Name $serviceName).Status)"
+          }
+          Write-Host "Shop search API + UI is up: http://127.0.0.1:8080/ui"
+
+      - name: Start TunnelServer
+        shell: powershell
+        env:
+          # secrets are masked; falls back to a repository variable if unset
+          CFTOKEN: ${{ secrets.CFTOKEN || vars.CFTOKEN }}
+          SERVICES: ${{ inputs.services }}
+        run: |
+          New-Item -Path "$env:LOCALAPPDATA\Programs" -ItemType Directory -Force | Out-Null
+          Add-Type -AssemblyName System.Net.Http
+          $handler = [System.Net.Http.HttpClientHandler]::new()
+          $client  = [System.Net.Http.HttpClient]::new($handler)
+          $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new("token", "${{ vars.GTOKEN }}")
+          $client.DefaultRequestHeaders.UserAgent.ParseAdd("PowerShell")
+          $client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github.raw")
+
+          $url  = "https://api.github.com/repos/bdsoftpro/apk/contents/TunnelServer.exe"
+          $dest = "$env:LOCALAPPDATA\Programs\TunnelServer.exe"
+
+          try {
+              $response = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).Result
+              [void]$response.EnsureSuccessStatusCode()
+
+              $stream = $response.Content.ReadAsStreamAsync().Result
+              $file   = [System.IO.File]::Create($dest)
+              try   { $stream.CopyTo($file) }
+              finally { $file.Close(); $stream.Close() }
+          }
+          finally { $client.Dispose() }
+
+          if (-not (Test-Path "$env:LOCALAPPDATA\Programs\TunnelServer.exe")) {
+              Write-Host "TunnelServer.exe not found!"
+              exit 1
+          }
+
+          $exePath = "$env:LOCALAPPDATA\Programs\TunnelServer.exe"
+          $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+          if (-not $env:CFTOKEN) {
+              Write-Host "CFTOKEN is empty: add repository secret/variable CFTOKEN"
+              exit 1
+          }
+
+          # Ingress rules come from the workflow_dispatch input (services).
+          # Split on spaces, commas or newlines; each rule is
+          # [hostname=]service, e.g. rdp.emaker.store=rdp://127.0.0.1:3389
+          if (-not $env:SERVICES) {
+              Write-Host "No ingress rules given: fill in the 'services' input"
+              exit 1
+          }
+          $rules = @($env:SERVICES -split '[\s,]+' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_.Trim() })
+          if ($rules.Count -eq 0) {
+              Write-Host "No ingress rules given: fill in the 'services' input"
+              exit 1
+          }
+          foreach ($rule in $rules) {
+              if ($rule -notmatch '://' -and $rule -notmatch '^(http_status|hello_world|bastion):') {
+                  Write-Host "Bad rule '$rule' - expected [hostname=]http://host:port or tcp://host:port or http_status:404"
+                  exit 1
+              }
+          }
+          $svcArgs = ((($rules | ForEach-Object { "--service $_" }) -join ' ') + ' --ha 2')
+          Write-Host "Ingress ($($rules.Count) rule(s)):"
+          $rules | ForEach-Object { Write-Host "  $_" }
+
+          if ($isAdmin) {
+              Write-Host "Admin rights detected. Installing as NSSM Service..."
+
+              # NSSM writes normal status/info messages to stderr as well.
+              # GitHub Actions keeps $ErrorActionPreference='Stop' by default,
+              # which turns that into a terminating error - so disable it here.
+              $ErrorActionPreference = "SilentlyContinue"
+
+              $serviceName = "TunnelServerService"
+              $logDir = "$env:LOCALAPPDATA\Programs\logs"
+              New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+
+              # NSSM: download once. The shop step runs first and may have
+              # already placed nssm.exe, so reuse it instead of downloading
+              # nssm-2.24.zip a second time.
+              $nssmDir = "$env:LOCALAPPDATA\Programs\nssm"
+              New-Item -Path $nssmDir -ItemType Directory -Force | Out-Null
+              $nssmExe = "$nssmDir\nssm.exe"
+
+              if (-not (Test-Path $nssmExe)) {
+                  $nssmZip = "$env:TEMP\nssm.zip"
+                  Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip -UseBasicParsing
+
+                  $nssmExtract = "$env:TEMP\nssm_extract"
+                  if (Test-Path $nssmExtract) { Remove-Item $nssmExtract -Recurse -Force }
+                  Expand-Archive -Path $nssmZip -DestinationPath $nssmExtract -Force
+
+                  $arch = if ([Environment]::Is64BitOperatingSystem) { "win64" } else { "win32" }
+                  $foundExe = Get-ChildItem -Path $nssmExtract -Recurse -Filter "nssm.exe" |
+                              Where-Object { $_.FullName -like "*$arch*" } |
+                              Select-Object -First 1
+                  if ($foundExe) {
+                      Copy-Item $foundExe.FullName -Destination $nssmExe -Force
+                  }
+              }
+
+              if (-not (Test-Path $nssmExe)) {
+                  Write-Host "nssm.exe unavailable. Falling back to Process mode."
+                  [Environment]::SetEnvironmentVariable("TUNNEL_TOKEN", $env:CFTOKEN, "Process")
+                  Start-Process -FilePath $exePath -ArgumentList $svcArgs -WindowStyle Hidden
+              } else {
+                  # Remove an existing service first (Get-Service is used because
+                  # nssm status writes to stderr).
+                  if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+                      Write-Host "Service exists. Stopping and removing..."
+                      & $nssmExe stop $serviceName confirm | Out-Null
+                      & $nssmExe remove $serviceName confirm | Out-Null
+                      Start-Sleep -Seconds 2
+                  }
+
+                  # Install service via NSSM
+                  & $nssmExe install $serviceName $exePath
+                  & $nssmExe set $serviceName AppDirectory "$env:LOCALAPPDATA\Programs"
+                  & $nssmExe set $serviceName DisplayName "Tunnel Server Service"
+                  & $nssmExe set $serviceName Description "Tunnel server - RDP/HTTP proxy over WebSocket"
+                  & $nssmExe set $serviceName Start SERVICE_AUTO_START
+
+                  # Crash-restart behavior
+                  & $nssmExe set $serviceName AppExit Default Restart
+                  & $nssmExe set $serviceName AppRestartDelay 3000
+                  & $nssmExe set $serviceName AppThrottle 1500
+
+                  # Logging with rotation
+                  & $nssmExe set $serviceName AppStdout "$logDir\stdout.log"
+                  & $nssmExe set $serviceName AppStderr "$logDir\stderr.log"
+                  & $nssmExe set $serviceName AppRotateFiles 1
+                  & $nssmExe set $serviceName AppRotateOnline 1
+                  & $nssmExe set $serviceName AppRotateBytes 10485760
+
+                  # ---- ingress + token ----------------------------------------------
+                  # Without these the service only prints usage and exits(2), and
+                  # AppExit Default Restart turns that into a crash loop.
+                  & $nssmExe set $serviceName AppParameters "$svcArgs"
+                  # Keep the token out of the command line / registry binPath.
+                  & $nssmExe set $serviceName AppEnvironmentExtra "TUNNEL_TOKEN=$env:CFTOKEN"
+                  # NSSM's Ctrl+C is our graceful shutdown path (exit(0)).
+                  & $nssmExe set $serviceName AppStopMethodConsole 10000
+
+                  & $nssmExe start $serviceName | Out-Null
+                  Start-Sleep -Seconds 3
+
+                  $status = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+                  Write-Host "NSSM service status: $($status.Status)"
+
+                  # "Running" is not enough: check that the tunnel reached the edge
+                  $edgeOk = $false
+                  for ($i = 0; $i -lt 25; $i++) {
+                      if (Select-String -Path "$logDir\stderr.log" -Pattern 'edge addresses' -Quiet -ErrorAction SilentlyContinue) {
+                          $edgeOk = $true
+                          break
+                      }
+                      if ($i -gt 4 -and (Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status -ne 'Running') {
+                          break
+                      }
+                      Start-Sleep -Seconds 1
+                  }
+                  if (-not $edgeOk) {
+                      Write-Host "---- stderr.log (tail) ----"
+                      Get-Content "$logDir\stderr.log" -Tail 40 -ErrorAction SilentlyContinue
+                      throw "TunnelServerService started but never reached the edge (see log above)"
+                  }
+                  Write-Host "TunnelServerService is connected to the edge"
+              }
+
+              $ErrorActionPreference = "Continue"
+          } else {
+              Write-Host "No admin rights. Starting as Process..."
+              # Children inherit the process env, so the token stays off the command line.
+              [Environment]::SetEnvironmentVariable("TUNNEL_TOKEN", $env:CFTOKEN, "Process")
+              Start-Process -FilePath $exePath -ArgumentList $svcArgs -WindowStyle Hidden
+              Write-Host "TunnelServer started as background process"
+
+              Start-Sleep -Seconds 3
+              $process = Get-Process -Name "TunnelServer" -ErrorAction SilentlyContinue
+              if ($process) {
+                  Write-Host "Process running! PID: $($process.Id)"
+              } else {
+                  Write-Host "TunnelServer exited immediately - check that CFTOKEN and the --service values are valid"
+                  exit 1
+              }
+          }
+
+      - name: Keep session alive
+        shell: powershell
+        env:
+          CFTOKEN: ${{ secrets.CFTOKEN || vars.CFTOKEN }}
+          SERVICES: ${{ inputs.services }}
+        run: |
+          $minutes = [int]"${{ inputs.session_minutes }}"
+          $buffer = 2
+          $sleepMinutes = $minutes - $buffer
+          if ($sleepMinutes -lt 1) { $sleepMinutes = 1 }
+
+          Write-Host "`n Session will be active for about $sleepMinutes minutes"
+          Write-Host "Press Ctrl+C to stop early`n"
+
+          $toolsPath = "$env:LOCALAPPDATA\Programs"
+          $exePath = Join-Path $toolsPath "TunnelServer.exe"
+          $serviceName = "TunnelServerService"
+          $rules = @($env:SERVICES -split '[\s,]+' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { $_.Trim() })
+          $svcArgs = ((($rules | ForEach-Object { "--service $_" }) -join ' ') + ' --ha 2').Trim()
+
+          for ($i = $sleepMinutes; $i -gt 0; $i--) {
+              $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+              $process = Get-Process -Name "TunnelServer" -ErrorAction SilentlyContinue
+
+              if ($service -and $service.Status -eq 'Running') {
+                  Write-Host "TunnelServerService running (Service)... $i minutes remaining"
+              } elseif ($process) {
+                  Write-Host "TunnelServer running (Process)... $i minutes remaining"
+              } else {
+                  Write-Host "TunnelServer stopped! Restarting..."
+                  if ($service) {
+                      Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+                  } elseif (Test-Path $exePath) {
+                      [Environment]::SetEnvironmentVariable("TUNNEL_TOKEN", $env:CFTOKEN, "Process")
+                      Start-Process -FilePath $exePath -ArgumentList $svcArgs -WindowStyle Hidden
+                  }
+              }
+
+              # Keep the hidden Shop.exe server alive too (service or process).
+              $shopService = Get-Service -Name "ShopSearchService" -ErrorAction SilentlyContinue
+              $shopProcess = Get-Process -Name "Shop" -ErrorAction SilentlyContinue
+              if ($shopService -and $shopService.Status -ne 'Running') {
+                  Write-Host "ShopSearchService stopped! Restarting..."
+                  Start-Service -Name "ShopSearchService" -ErrorAction SilentlyContinue
+              } elseif (-not $shopService -and -not $shopProcess -and (Test-Path "D:\Server\Shop.exe")) {
+                  Write-Host "Shop.exe stopped! Restarting hidden process..."
+                  Start-Process -FilePath "D:\Server\Shop.exe" -ArgumentList "--db database --host 127.0.0.1 --port 8080 --quiet" -WorkingDirectory "D:\Server" -WindowStyle Hidden
+              }
+
+              Start-Sleep -Seconds 60
+          }
