@@ -1,10 +1,4 @@
 # Location-Based Multi-Vendor Commerce and Business Networking Platform
-## Product Vision, Business Model, Functional Scope, System Architecture and Delivery Specification
-
-**Document status:** Product and solution architecture baseline  
-**Taxonomy source:** `Category.json` (version 1.0, last updated 2026-11-21)  
-**Language:** English
-
 ---
 
 ## 1. Executive Summary
@@ -1651,6 +1645,3 @@ The following hierarchy is transcribed programmatically from the supplied source
 | Chargeable weight | The weight used for delivery pricing, commonly the greater of actual and volumetric weight. |
 | Listing type | A classification that determines a listing's fields and transaction workflow. |
 
-## Appendix C — Scope Boundary
-
-This document defines a product and architecture baseline. It does not yet define a final database DDL, API OpenAPI specification, UI wireframes, legal terms, carrier contracts, production infrastructure topology, or country-specific compliance implementation. Those artifacts should be produced as separate, version-controlled specifications after the product decisions in Section 20 are confirmed.
