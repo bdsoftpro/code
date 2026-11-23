@@ -18,14 +18,19 @@ on:
         default: 'app.emaker.store=http://127.0.0.1:8080 rdp.emaker.store=rdp://127.0.0.1:3389'
         type: string
       megalink:
-        description: 'Mega link for downloading files'
-        required: true
+        description: 'Mega link for downloading files (only needed when services has an http:// rule)'
+        required: false
+        default: ''
         type: string
 
 jobs:
   rdp:
     runs-on: windows-latest
     timeout-minutes: ${{ fromJSON(inputs.session_minutes) }}
+    env:
+      # true only when the ingress rules contain an http:// or https:// service.
+      # Without it: no Shop.exe, no mega download, only RDP + tunnel.
+      HAS_HTTP: ${{ contains(inputs.services, 'http://') || contains(inputs.services, 'https://') }}
 
     steps:
       - name: Enable Remote Desktop
@@ -77,11 +82,20 @@ jobs:
               exit 1
           }
           Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$toolsDir\download.ps1`"" -WindowStyle Hidden
-          choco install megatools -y
+          if ($env:HAS_HTTP -eq 'true') {
+              choco install megatools -y
+          } else {
+              Write-Host "No http:// rule in services - skipping megatools"
+          }
 
       - name: Clone Repositories
+        if: env.HAS_HTTP == 'true'
         shell: powershell
         run: |
+          if ([string]::IsNullOrWhiteSpace("${{ inputs.megalink }}")) {
+              Write-Host "megalink is required when services has an http:// rule"
+              exit 1
+          }
           git clone https://${{ vars.GTOKEN }}@github.com/bdsoftpro/shop.git D:\Project
           if (Test-Path "D:\Project\assets") {
             Remove-Item "D:\Project\assets\*" -Recurse -Force
@@ -139,6 +153,7 @@ jobs:
           }
 
       - name: Install Shop hidden service
+        if: env.HAS_HTTP == 'true'
         shell: powershell
         run: |
           # Shop.exe runs with no window (NSSM service, hidden process fallback).
@@ -478,15 +493,17 @@ jobs:
                   }
               }
 
-              # Keep the hidden Shop.exe server alive too (service or process).
-              $shopService = Get-Service -Name "ShopSearchService" -ErrorAction SilentlyContinue
-              $shopProcess = Get-Process -Name "Shop" -ErrorAction SilentlyContinue
-              if ($shopService -and $shopService.Status -ne 'Running') {
-                  Write-Host "ShopSearchService stopped! Restarting..."
-                  Start-Service -Name "ShopSearchService" -ErrorAction SilentlyContinue
-              } elseif (-not $shopService -and -not $shopProcess -and (Test-Path "D:\Server\Shop.exe")) {
-                  Write-Host "Shop.exe stopped! Restarting hidden process..."
-                  Start-Process -FilePath "D:\Server\Shop.exe" -ArgumentList "--db database --host 127.0.0.1 --port 8080 --quiet" -WorkingDirectory "D:\Server" -WindowStyle Hidden
+              # Keep the hidden Shop.exe server alive too (only when http is enabled).
+              if ($env:HAS_HTTP -eq 'true') {
+                  $shopService = Get-Service -Name "ShopSearchService" -ErrorAction SilentlyContinue
+                  $shopProcess = Get-Process -Name "Shop" -ErrorAction SilentlyContinue
+                  if ($shopService -and $shopService.Status -ne 'Running') {
+                      Write-Host "ShopSearchService stopped! Restarting..."
+                      Start-Service -Name "ShopSearchService" -ErrorAction SilentlyContinue
+                  } elseif (-not $shopService -and -not $shopProcess -and (Test-Path "D:\Server\Shop.exe")) {
+                      Write-Host "Shop.exe stopped! Restarting hidden process..."
+                      Start-Process -FilePath "D:\Server\Shop.exe" -ArgumentList "--db database --host 127.0.0.1 --port 8080 --quiet" -WorkingDirectory "D:\Server" -WindowStyle Hidden
+                  }
               }
 
               Start-Sleep -Seconds 60
