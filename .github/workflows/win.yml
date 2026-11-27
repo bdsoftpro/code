@@ -20,7 +20,7 @@ on:
       shop_server:
         description: 'Run Shop server (Shop.exe + mega download). Unchecked = only RDP + tunnel'
         required: true
-        default: true
+        default: false
         type: boolean
       megalink:
         description: 'Mega link (REQUIRED if Shop server is checked, ignored otherwise)'
