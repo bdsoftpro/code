@@ -47,7 +47,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             xfce4 xfce4-goodies xrdp dbus-x11 procps unzip curl \
-            xfce4-session xfconf xorgxrdp \
+            xfce4-session xfconf xorgxrdp openbox \
             polkitd pkexec xvfb xauth python3 libx11-6 libxtst6 \
             openjdk-21-jdk
           curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
@@ -104,8 +104,25 @@ jobs:
           export XDG_SESSION_DESKTOP=xfce
           export XDG_CURRENT_DESKTOP=XFCE
           export LANG=C.UTF-8
+          ls -ld "$HOME" "$HOME/.config" "$HOME/.cache" "$HOME/.local"
           ls -l /usr/lib/x86_64-linux-gnu/xfce4/xfconf/xfconfd /usr/share/dbus-1/services/org.xfce.Xfconf.service
-          exec dbus-launch --exit-with-session startxfce4
+          # diagnostics: can xfconfd be started/activated on a fresh session bus?
+          dbus-launch --exit-with-session sh -c '
+            echo "--- diag: bus=$DBUS_SESSION_BUS_ADDRESS"
+            xfconf-query -c xfce4-session -l
+            echo "--- diag: xfconf-query rc=$?"
+            pgrep -a xfconfd
+            timeout 5 /usr/lib/x86_64-linux-gnu/xfce4/xfconf/xfconfd
+            echo "--- diag: xfconfd direct rc=$?"
+          '
+          start=$(date +%s)
+          dbus-launch --exit-with-session startxfce4
+          end=$(date +%s)
+          echo "startxfce4 exited after $((end-start))s"
+          if [ $((end-start)) -lt 300 ]; then
+            echo "XFCE ended early: falling back to openbox"
+            exec dbus-launch --exit-with-session openbox-session
+          fi
           STARTWM
           sudo chmod 755 /etc/xrdp/startwm.sh
           sudo adduser xrdp ssl-cert
