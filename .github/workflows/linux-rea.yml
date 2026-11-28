@@ -74,8 +74,19 @@ jobs:
           });
           EOF
           sudo systemctl restart polkit || true
-          echo "xfce4-session" | sudo tee /home/rdpuser/.xsession >/dev/null
+          # XFCE needs its own D-Bus session under xrdp (plain `xfce4-session`
+          # gives "Unable to load a failsafe session / xfconfd isn't running")
+          sudo tee /home/rdpuser/.xsession >/dev/null <<'XSESSION'
+          #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_SESSION_DESKTOP=xfce
+          export XDG_CURRENT_DESKTOP=XFCE
+          exec dbus-launch --exit-with-session startxfce4
+          XSESSION
           sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
+          sudo chmod 755 /home/rdpuser/.xsession
           sudo adduser xrdp ssl-cert
           sudo systemctl enable --now xrdp
 
