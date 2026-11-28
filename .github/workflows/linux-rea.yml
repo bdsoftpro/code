@@ -1,0 +1,274 @@
+name: Rea Desktop
+
+# Ubuntu desktop (xrdp) + opencode TUI + REA (morluto/rea), exposed through TunnelServer.
+# Place at .github/workflows/rea-desktop.yml
+#
+# Secrets / variables:
+#   RDP_PASSWORD       (secret)            password for rdpuser
+#   CFTOKEN            (secret or var)     tunnel token
+#   GTOKEN             (secret or var)     token used to download TunnelServer from bdsoftpro/apk
+#   ANTHROPIC_API_KEY  (secret, optional)  otherwise run `opencode auth login` in the TUI
+
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "Tunnel ingress rules (space/comma/newline separated), e.g. rdp.example.com=rdp://127.0.0.1:3389"
+        required: true
+        default: "rdp.emaker.store=rdp://127.0.0.1:3389"
+      tunnel_asset:
+        description: "Linux TunnelServer file name inside bdsoftpro/apk"
+        required: true
+        default: "TunnelServer-linux"
+      install_hopper:
+        description: "Install Hopper demo (native binary analysis)"
+        type: boolean
+        default: true
+      ghidra_url:
+        description: "Ghidra release zip URL (empty = skip)"
+        required: false
+        default: ""
+      jadx_jar_url:
+        description: "jadx-headless-mcp-0.7.1-all.jar URL (empty = skip)"
+        required: false
+        default: ""
+      target_url:
+        description: "File URL to analyze (empty = skip). Only software you own or are authorized to analyze"
+        required: false
+        default: ""
+
+jobs:
+  desktop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Desktop, xrdp, JDK, base tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-goodies xrdp dbus-x11 procps unzip curl \
+            openjdk-21-jdk
+          curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+
+      - name: Create rdpuser
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          [ -n "${RDP_PASSWORD:-}" ] || { echo "RDP_PASSWORD secret is empty"; exit 1; }
+          sudo useradd -m -s /bin/bash rdpuser
+          echo "rdpuser:${RDP_PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo rdpuser
+          # ephemeral VM: passwordless sudo so REA setup can install packages
+          echo "rdpuser ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/rdpuser >/dev/null
+          sudo chmod 440 /etc/sudoers.d/rdpuser
+          echo "xfce4-session" | sudo tee /home/rdpuser/.xsession >/dev/null
+          sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
+          sudo adduser xrdp ssl-cert
+          sudo systemctl enable --now xrdp
+
+      - name: Fetch Ghidra / JADX / target (optional)
+        env:
+          GHIDRA_URL: ${{ inputs.ghidra_url }}
+          JADX_URL: ${{ inputs.jadx_jar_url }}
+          TARGET_URL: ${{ inputs.target_url }}
+        run: |
+          sudo mkdir -p /opt/rea-tools
+          sudo chmod 755 /opt/rea-tools
+          if [ -n "$GHIDRA_URL" ]; then
+            curl -fsSL "$GHIDRA_URL" -o /tmp/ghidra.zip
+            sudo unzip -q /tmp/ghidra.zip -d /opt/rea-tools
+          fi
+          if [ -n "$JADX_URL" ]; then
+            sudo curl -fsSL "$JADX_URL" -o /opt/rea-tools/jadx-headless-mcp-0.7.1-all.jar
+            sha256sum /opt/rea-tools/jadx-headless-mcp-0.7.1-all.jar
+          fi
+          sudo -u rdpuser mkdir -p /home/rdpuser/target
+          if [ -n "$TARGET_URL" ]; then
+            NAME="$(basename "${TARGET_URL%%\?*}")"
+            sudo -u rdpuser curl -fsSL "$TARGET_URL" -o "/home/rdpuser/target/$NAME"
+          fi
+
+      - name: Install opencode + REA as rdpuser
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          INSTALL_HOPPER: ${{ inputs.install_hopper }}
+        run: |
+          cat > /tmp/setup-rea.sh <<'EOF'
+          set -euo pipefail
+          cd "$HOME"
+
+          # engine env vars (setup records them in the opencode registration)
+          export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+          G="$(ls -d /opt/rea-tools/ghidra_* 2>/dev/null | head -1 || true)"
+          if [ -n "$G" ]; then export GHIDRA_INSTALL_DIR="$G"; fi
+          J=/opt/rea-tools/jadx-headless-mcp-0.7.1-all.jar
+          if [ -f "$J" ]; then export REA_JADX_MCP_JAR="$J"; fi
+
+          # opencode
+          curl -fsSL https://opencode.ai/install | bash
+          {
+            echo 'export PATH=$HOME/.opencode/bin:$PATH'
+            echo "export JAVA_HOME=$JAVA_HOME"
+            if [ -n "${GHIDRA_INSTALL_DIR:-}" ]; then echo "export GHIDRA_INSTALL_DIR=$GHIDRA_INSTALL_DIR"; fi
+            if [ -n "${REA_JADX_MCP_JAR:-}" ]; then echo "export REA_JADX_MCP_JAR=$REA_JADX_MCP_JAR"; fi
+            if [ -n "${ANTHROPIC_API_KEY:-}" ]; then echo "export ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"; fi
+          } >> ~/.bashrc
+
+          # REA setup (run from a trusted dir outside the analyzed project)
+          FLAGS="--client opencode --yes"
+          if [ "$INSTALL_HOPPER" = "true" ]; then FLAGS="$FLAGS --install-hopper"; fi
+          npx -y rea-agents@latest setup $FLAGS
+          npx -y rea-agents@latest doctor --client opencode --skill --json | head -c 4000 || true
+          EOF
+          chmod 755 /tmp/setup-rea.sh
+          sudo --preserve-env=ANTHROPIC_API_KEY,INSTALL_HOPPER -u rdpuser -H bash /tmp/setup-rea.sh
+
+      - name: Start TunnelServer (Linux)
+        shell: bash
+        env:
+          CFTOKEN: ${{ secrets.CFTOKEN || vars.CFTOKEN }}
+          GTOKEN: ${{ secrets.GTOKEN || vars.GTOKEN }}
+          SERVICES: ${{ inputs.services }}
+          TUNNEL_ASSET: ${{ inputs.tunnel_asset }}
+        run: |
+          set -uo pipefail
+
+          # ---- download ---------------------------------------------------
+          BIN_DIR="$HOME/.local/share/tunnel-server"
+          mkdir -p "$BIN_DIR"
+          BIN="$BIN_DIR/TunnelServer"
+          curl -fsSL \
+            -H "Authorization: token ${GTOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            -A "curl" \
+            "https://api.github.com/repos/bdsoftpro/apk/contents/${TUNNEL_ASSET}" \
+            -o "$BIN" || { echo "TunnelServer download failed"; exit 1; }
+          chmod 755 "$BIN"
+          [ -x "$BIN" ] || { echo "TunnelServer not found!"; exit 1; }
+
+          # ---- validate inputs --------------------------------------------
+          [ -n "${CFTOKEN:-}" ] || { echo "CFTOKEN is empty: add repository secret/variable CFTOKEN"; exit 1; }
+          [ -n "${SERVICES:-}" ] || { echo "No ingress rules given: fill in the 'services' input"; exit 1; }
+
+          mapfile -t RULES < <(printf '%s' "$SERVICES" | tr ',[:space:]' '\n' | sed '/^$/d')
+          [ "${#RULES[@]}" -gt 0 ] || { echo "No ingress rules given"; exit 1; }
+
+          SVC_ARGS=()
+          for r in "${RULES[@]}"; do
+            if [[ "$r" != *"://"* && ! "$r" =~ ^(http_status|hello_world|bastion): ]]; then
+              echo "Bad rule '$r' - expected [hostname=]http://host:port or tcp://host:port or http_status:404"
+              exit 1
+            fi
+            SVC_ARGS+=(--service "$r")
+          done
+          SVC_ARGS+=(--ha 2)
+          echo "Ingress (${#RULES[@]} rule(s)):"
+          printf '  %s\n' "${RULES[@]}"
+
+          # ---- admin? -----------------------------------------------------
+          if sudo -n true 2>/dev/null && [ -d /run/systemd/system ]; then
+            echo "sudo + systemd detected. Installing systemd service..."
+            SERVICE=tunnelserver
+            LOG_DIR=/var/log/tunnel-server
+            sudo install -d -m 755 "$LOG_DIR"
+            sudo install -m 755 "$BIN" /usr/local/bin/TunnelServer
+
+            # keep the token off the command line: root-only env file
+            sudo install -m 600 /dev/null /etc/tunnel-server.env
+            printf 'TUNNEL_TOKEN=%s\n' "$CFTOKEN" | sudo tee /etc/tunnel-server.env >/dev/null
+
+            # '%' is special in systemd unit files
+            EXEC_ARGS="$(printf '%s ' "${SVC_ARGS[@]}" | sed 's/%/%%/g')"
+
+            sudo tee /etc/systemd/system/${SERVICE}.service >/dev/null <<EOF
+          [Unit]
+          Description=Tunnel Server Service (RDP/HTTP proxy over WebSocket)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          EnvironmentFile=/etc/tunnel-server.env
+          ExecStart=/usr/local/bin/TunnelServer ${EXEC_ARGS}
+          WorkingDirectory=/usr/local/bin
+          # graceful shutdown (same role as NSSM's Ctrl+C)
+          KillSignal=SIGINT
+          TimeoutStopSec=10
+          # crash-restart (AppExit Default Restart / AppRestartDelay 3000)
+          Restart=always
+          RestartSec=3
+          StartLimitIntervalSec=0
+          StandardOutput=append:${LOG_DIR}/stdout.log
+          StandardError=append:${LOG_DIR}/stderr.log
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+            # log rotation (10 MB)
+            sudo tee /etc/logrotate.d/tunnel-server >/dev/null <<EOF
+          ${LOG_DIR}/*.log {
+              size 10M
+              rotate 5
+              copytruncate
+              missingok
+              notifempty
+          }
+          EOF
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now ${SERVICE}
+            sleep 3
+            echo "systemd service status: $(systemctl is-active ${SERVICE})"
+
+            # "active" is not enough: check that the tunnel reached the edge
+            edge_ok=false
+            for i in $(seq 1 25); do
+              if sudo grep -q 'edge addresses' "${LOG_DIR}/stderr.log" 2>/dev/null; then
+                edge_ok=true
+                break
+              fi
+              if [ "$i" -gt 5 ] && [ "$(systemctl is-active ${SERVICE})" != "active" ]; then
+                break
+              fi
+              sleep 1
+            done
+            if [ "$edge_ok" != true ]; then
+              echo "---- stderr.log (tail) ----"
+              sudo tail -n 40 "${LOG_DIR}/stderr.log" 2>/dev/null
+              echo "---- journalctl ----"
+              sudo journalctl -u ${SERVICE} -n 40 --no-pager
+              echo "TunnelServer service started but never reached the edge"
+              exit 1
+            fi
+            echo "TunnelServer service is connected to the edge"
+          else
+            echo "No sudo/systemd. Starting as background process..."
+            LOG_DIR="$HOME/.local/share/tunnel-server/logs"
+            mkdir -p "$LOG_DIR"
+            # child inherits the env, so the token stays off the command line
+            TUNNEL_TOKEN="$CFTOKEN" nohup "$BIN" "${SVC_ARGS[@]}" \
+              >"$LOG_DIR/stdout.log" 2>"$LOG_DIR/stderr.log" &
+            sleep 3
+            if pgrep -x TunnelServer >/dev/null; then
+              echo "Process running! PID: $(pgrep -x TunnelServer | head -1)"
+            else
+              tail -n 40 "$LOG_DIR/stderr.log"
+              echo "TunnelServer exited immediately - check CFTOKEN and the --service values"
+              exit 1
+            fi
+          fi
+
+      - name: Ready
+        run: |
+          echo "RDP via your tunnel hostname, user: rdpuser"
+          echo "In the desktop terminal: cd ~/target && opencode"
+          echo "To end early: create /tmp/stop on the runner, or cancel the run."
+
+      - name: Keep alive
+        run: |
+          for i in $(seq 1 330); do
+            [ -f /tmp/stop ] && break
+            sleep 60
+          done
