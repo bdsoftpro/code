@@ -101,6 +101,14 @@ jobs:
           unset XDG_RUNTIME_DIR
           export XDG_CONFIG_DIRS=/etc/xdg
           export XDG_DATA_DIRS=/usr/local/share:/usr/share
+          # Root cause of "Unable to load a failsafe session": the runner image's
+          # XDG_CONFIG_HOME=/home/runner/.config leaks into this session, rdpuser cannot
+          # use it, so xfconfd/xfce4-session fail. Point everything at rdpuser's home.
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_STATE_HOME="$HOME/.local/state"
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
           export XDG_SESSION_DESKTOP=xfce
           export XDG_CURRENT_DESKTOP=XFCE
           export LANG=C.UTF-8
@@ -126,7 +134,10 @@ jobs:
           STARTWM
           sudo chmod 755 /etc/xrdp/startwm.sh
           sudo adduser xrdp ssl-cert
-          sudo systemctl enable --now xrdp
+          # xrdp was already started by apt before joining ssl-cert (key.pem "Permission
+          # denied" in xrdp.log), so it must be restarted for TLS to work
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp-sesman xrdp
 
       - name: Fetch Ghidra / JADX / target (optional)
         env:
