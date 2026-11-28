@@ -324,14 +324,18 @@ jobs:
         run: |
           # Every 15 s: if the xrdp/XFCE logs changed, print them here so a failed
           # RDP login can be diagnosed from the Actions log (no shell on the VM needed).
+          # NOTE: tail exits 1 when a file does not exist yet (e.g. before the first
+          # RDP login); GitHub runs steps with `bash -e`, so never let that fail the step.
+          set +e
           last=""
           for i in $(seq 1 1320); do
             [ -f /tmp/stop ] && break
-            cur="$(sudo sh -c 'tail -n 40 /var/log/xrdp-sesman.log /var/log/xrdp.log /home/rdpuser/.startwm.log /home/rdpuser/.xsession-errors 2>/dev/null' | md5sum)"
+            cur="$(sudo sh -c 'tail -n 40 /var/log/xrdp-sesman.log /var/log/xrdp.log /home/rdpuser/.startwm.log /home/rdpuser/.xsession-errors 2>/dev/null; true' | md5sum)"
             if [ "$cur" != "$last" ]; then
               echo "================ session logs ($(date +%T)) ================"
-              sudo sh -c 'tail -n 40 /var/log/xrdp-sesman.log /var/log/xrdp.log /home/rdpuser/.startwm.log /home/rdpuser/.xsession-errors 2>/dev/null'
+              sudo sh -c 'tail -n 40 /var/log/xrdp-sesman.log /var/log/xrdp.log /home/rdpuser/.startwm.log /home/rdpuser/.xsession-errors 2>/dev/null; true'
               last="$cur"
             fi
             sleep 15
           done
+          exit 0
