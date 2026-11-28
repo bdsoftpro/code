@@ -47,6 +47,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             xfce4 xfce4-goodies xrdp dbus-x11 procps unzip curl \
+            polkitd pkexec xvfb xauth python3 libx11-6 libxtst6 \
             openjdk-21-jdk
           curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
           sudo apt-get install -y nodejs
@@ -62,6 +63,17 @@ jobs:
           # ephemeral VM: passwordless sudo so REA setup can install packages
           echo "rdpuser ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/rdpuser >/dev/null
           sudo chmod 440 /etc/sudoers.d/rdpuser
+          # REA setup installs Hopper through pkexec (polkit), which needs an auth
+          # agent/TTY. In this ephemeral VM allow the sudo group without prompting.
+          sudo mkdir -p /etc/polkit-1/rules.d
+          sudo tee /etc/polkit-1/rules.d/49-rdpuser-nopasswd.rules >/dev/null <<'EOF'
+          polkit.addRule(function(action, subject) {
+              if (subject.isInGroup("sudo")) {
+                  return polkit.Result.YES;
+              }
+          });
+          EOF
+          sudo systemctl restart polkit || true
           echo "xfce4-session" | sudo tee /home/rdpuser/.xsession >/dev/null
           sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
           sudo adduser xrdp ssl-cert
