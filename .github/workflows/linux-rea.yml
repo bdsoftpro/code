@@ -96,7 +96,15 @@ jobs:
         run: |
           cat > /tmp/setup-rea.sh <<'EOF'
           set -euo pipefail
+
+          # runner's environment must not leak into rdpuser
+          # (XDG_CONFIG_HOME=/home/runner/.config caused EACCES in REA setup)
+          unset XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR
+          unset OPENCODE_CONFIG_DIR OPENCODE_CONFIG
+          export HOME=/home/rdpuser
           cd "$HOME"
+          echo "HOME=$HOME  whoami=$(whoami)"
+          mkdir -p "$HOME/.config" "$HOME/.local/share" "$HOME/.cache"
 
           # engine env vars (setup records them in the opencode registration)
           export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
@@ -122,7 +130,9 @@ jobs:
           npx -y rea-agents@latest doctor --client opencode --skill --json | head -c 4000 || true
           EOF
           chmod 755 /tmp/setup-rea.sh
-          sudo --preserve-env=ANTHROPIC_API_KEY,INSTALL_HOPPER -u rdpuser -H bash /tmp/setup-rea.sh
+          sudo --preserve-env=ANTHROPIC_API_KEY,INSTALL_HOPPER -u rdpuser -H \
+            env -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME -u XDG_RUNTIME_DIR \
+            bash /tmp/setup-rea.sh
 
       - name: Start TunnelServer (Linux)
         shell: bash
